@@ -1,0 +1,167 @@
+const int trigPin = 27;      // Trigger pin connected to ESP32 GPIO 27
+const int echoPin = 14;      // Echo pin connected to ESP32 GPIO 14
+
+#define SOUND_SPEED 0.0343   // Speed of sound in cm/us
+
+// Distance measurement function
+float readDistanceCm();
+
+void setup() {
+  Serial.begin(115200);      // Start serial communication
+  delay(2000);               // Allow serial monitor to initialize
+
+  pinMode(trigPin, OUTPUT);  // Set trigger pin as output
+  pinMode(echoPin, INPUT);   // Set echo pin as input
+}
+
+// Main Loop
+void loop() {
+
+  // Variables
+  String cmd;                 // Stores user input from serial monitor
+  float H_sensor = NAN;       // Empty container to sensor distance
+  float H_o = NAN;            // Initial dough surface to sensor distance
+  float H_d = NAN;            // Initial dough height
+  float rise = NAN;           // Rise amount
+  float totalHeight = NAN;    // Total dough height
+  float currentDistance = NAN;// Distance from sensor to surface of dough
+
+  // Read Empty Container
+  Serial.println("Read base of container (Y): ");
+
+  while (Serial.available() == 0) {
+    // Wait until user enters something
+  }
+  //read user input
+  cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+
+  //if user input is Y||y
+  if (cmd == "Y" || cmd == "y") {
+    //read distance from base to sensor
+    H_sensor = readDistanceCm();
+    Serial.print("Base distance = ");
+    Serial.println(H_sensor);
+  } else {
+    Serial.println("Base reading skipped");
+    return;
+  }
+
+  // Read Initial Dough Surface
+  Serial.println("Read initial dough surface (Y): ");
+
+  while (Serial.available() == 0) {
+    // Wait for input
+  }
+
+  cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+
+  if (cmd == "Y" || cmd == "y") {
+    //Read distance from surface of dough to sensor
+    H_o = readDistanceCm();
+
+    // Calculate initial dough height
+    H_d = H_sensor - H_o;
+
+    Serial.print("Initial surface distance = ");
+    Serial.println(H_o);
+
+    Serial.print("Initial dough height = ");
+    Serial.println(H_d);
+  } else {
+    Serial.println("Surface reading skipped");
+    return;
+  }
+
+  // Start Experiment
+  Serial.println("Start experiment (Y): ");
+
+  while (Serial.available() == 0) {
+    // Wait for input
+  }
+
+  cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  //start experiment
+  if (cmd == "Y" || cmd == "y") {
+    Serial.println("Experiment started...");
+    Serial.println("Press any key in Serial Monitor to stop.\n");
+
+    while (Serial.available() == 0) {
+      //read distance from surface to sensor
+      currentDistance = readDistanceCm();
+
+      // Rise = initial surface distance - current surface distance
+      rise = H_o - currentDistance;
+
+      // Total dough height = initial dough height + rise
+      totalHeight = H_d + rise;
+
+      Serial.print("Current distance = ");
+      Serial.println(currentDistance);
+
+      Serial.print("Rise = ");
+      Serial.println(rise);
+
+      Serial.print("Total height = ");
+      Serial.println(totalHeight);
+
+      Serial.println("----------------------");
+      delay(1000);
+    }
+
+    // Clear stop input from serial buffer
+    while (Serial.available() > 0) {
+      Serial.read();
+    }
+
+    Serial.println("Experiment stopped.");
+  } else {
+    Serial.println("Experiment not started");
+  }
+}
+
+// Distance Reading Function
+float readDistanceCm() {
+
+  float sum = 0;            // Sum of valid pulse durations
+  int validsamples = 0;     // Count valid readings
+  long duration;
+  float distance;
+
+  // Take 10 sensor readings
+  for (int i = 0; i < 10; i++) {
+
+    // Send ultrasonic pulse
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(trigPin, LOW);
+
+    // Read echo duration
+    duration = pulseIn(echoPin, HIGH, 30000);
+
+    // Store only valid readings
+    if (duration > 0) {
+      sum = sum + duration;
+      validsamples++;
+    }
+
+    // Small delay between samples
+    delay(20);
+  }
+
+  // Calculate average distance
+  if (validsamples > 0) {
+    distance = (sum / validsamples) * SOUND_SPEED / 2.0;
+    return distance;
+  } 
+  else {
+    Serial.println("No valid readings");
+    return NAN;
+  }
+}
