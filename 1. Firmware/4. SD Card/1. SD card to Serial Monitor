@@ -1,1 +1,109 @@
+//Library Setup
+#include <WiFi.h>        // WiFi library
+#include <DHT.h>         // DHT sensor library
+#include "FS.h"          // File system library
+#include "SD.h"          // SD card library
+#include <SPI.h>         // SPI communication library
+#include "time.h"        // Time and NTP library
+#include <ESPmDNS.h>     // mDNS library
+#include <WiFiManager.h> // WiFi auto connect library
 
+//DHT Parameter Setup
+#define DHTPIN 4         // DHT data pin
+#define DHTTYPE DHT11    // DHT sensor type
+DHT dht(DHTPIN, DHTTYPE); // Create DHT object
+
+const char* ntpServer = "pool.ntp.org"; // NTP server
+const long  gmtOffset_sec = -18000;     // GMT offset
+const int   daylightOffset_sec = 3600;  // Daylight saving offset
+
+//Logging interval
+const unsigned long LOG_INTERVAL_MS = 1000; // Logging interval = 1 second
+unsigned long lastLog = 0;                  // Stores last logging time
+
+//Helpers
+String getFormattedDateTime() {             // Function to get formatted date and time
+  struct tm timeinfo;                       // Time structure
+  if (!getLocalTime(&timeinfo)) {           // Check if time is available
+    return "0000-00-00 00:00";              // Return default time if failed
+  }
+  char buf[20];                             // Character buffer
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &timeinfo); // Format date and time
+  return String(buf);                       // Return as string
+}
+
+void appendFile(fs::FS& fs, const char* path, const char* message) { // Append data to file
+  File file = fs.open(path, FILE_APPEND);   // Open file in append mode
+  if (!file) {                              // Check if file opened
+    Serial.println("Failed to open file for appending"); // Print error
+    return;                                 // Exit function
+  }
+  file.print(message);                      // Write message
+  file.close();                             // Close file
+}
+
+void logSensorData(float temperature, float humidity) { // Log sensor values
+  String ts = getFormattedDateTime();       // Get timestamp
+  String line = ts + "," + String(temperature, 1) + "," + String(humidity, 1) + "\n"; // Create CSV line
+  appendFile(SD, "/sensor_data.csv", line.c_str()); // Save to SD card
+}
+
+void setup() {                              // Setup function
+  Serial.begin(115200);                     // Start serial monitor
+  delay(500);                               // Small startup delay
+
+  dht.begin();                              // Start DHT sensor
+
+  if (!SD.begin()) {                        // Initialize SD card
+    Serial.println("SD init failed!");      // Print error
+    while (true) delay(1000);               // Stop program
+  }
+
+  if (!SD.exists("/sensor_data.csv")) {     // Check if file exists
+    File file = SD.open("/sensor_data.csv", FILE_WRITE); // Create file
+    if (file) {                             // Check file opened
+      file.println("Timestamp,Temperature,Humidity"); // Write header
+      file.close();                         // Close file
+    }
+  }
+
+  WiFiManager wm;                           // Create WiFi manager object
+  bool connect = wm.autoConnect("BreadMonitorSetup"); // Start WiFi portal
+  if (!connect) ESP.restart();              // Restart if failed
+
+  MDNS.begin("breadmonitor");               // Start mDNS service
+
+  if (WiFi.status() == WL_CONNECTED) {      // Check WiFi connection
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); // Setup NTP
+  } else {
+    Serial.println("WiFi not connected. Timestamps may be 0000-00-00 00:00"); // Error message
+  }
+
+  lastLog = millis();                       // Store initial time
+}
+
+void loop() {                               // Main loop
+  float h = dht.readHumidity();             // Read humidity
+  float t = dht.readTemperature();          // Read temperature
+
+  if (isnan(h) || isnan(t)) {               // Check invalid readings
+    Serial.println("DHT read failed!");     // Print error
+    delay(2000);                            // Wait 2 seconds
+    return;                                 // Skip rest of loop
+  }
+
+  Serial.print("Temp: ");                   // Print temperature label
+  Serial.print(t, 1);                       // Print temperature
+  Serial.print(" C | Hum: ");               // Print humidity label
+  Serial.print(h, 1);                       // Print humidity
+  Serial.println(" %");                     // Print unit
+
+  unsigned long now = millis();             // Get current time
+  if (now - lastLog >= LOG_INTERVAL_MS) {   // Check logging interval
+    logSensorData(t, h);                    // Save data
+    Serial.println("Logged to SD.");        // Confirmation message
+    lastLog = now;                          // Update log time
+  }
+
+  delay(1000);                              // Wait 1 second
+}
