@@ -1,0 +1,144 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+#include <ESP_Mail_Client.h>
+#include <ESPmDNS.h>
+
+//Web Server
+WebServer server(80);
+
+//Gmail SMTP Settings
+#define AUTHOR_EMAIL    "breadrisingmonitor@gmail.com"
+#define AUTHOR_PASSWORD "kjcd lstj cxqk bfqf"
+
+#define SMTP_HOST "smtp.gmail.com"
+#define SMTP_PORT 465
+
+SMTPSession smtp;
+ESP_Mail_Session session;
+SMTP_Message message;
+
+String recipientEmail = "";
+String emailStatus = "Idle";
+
+//SMTP Callback
+void smtpCallback(SMTP_Status status) {
+  if (status.success())
+    emailStatus = "Email sent successfully";
+  else
+    emailStatus = "Email failed";
+}
+
+//Send Email Function
+bool sendEmailNow() {
+  if (recipientEmail.length() < 6) {
+    emailStatus = "Invalid email";
+    return false;
+  }
+
+  session.server.host_name = SMTP_HOST;
+  session.server.port = SMTP_PORT;
+  session.login.email = AUTHOR_EMAIL;
+  session.login.password = AUTHOR_PASSWORD;
+  session.login.user_domain = "";
+
+  message.clear();
+  message.sender.name = "ESP32 Webserver";
+  message.sender.email = AUTHOR_EMAIL;
+  message.subject = "ESP32 Notification";
+  message.addRecipient("User", recipientEmail.c_str());
+
+  message.text.content = "Email sent using ESP32 webserver";
+  message.text.charSet = "utf-8";
+
+  smtp.callback(smtpCallback);
+
+  if (!smtp.connect(&session)) {
+    emailStatus = "SMTP connection failed";
+    return false;
+  }
+
+  bool success = MailClient.sendMail(&smtp, &message);
+  smtp.closeSession();
+
+  emailStatus = success ? "Email sent successfully" : "Send failed";
+  return success;
+}
+
+//Root Web Page
+void handleRoot() {
+  String html = R"rawliteral(
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <title>ESP32 Email Sender</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { font-family: Arial; padding: 20px; }
+      input, button { padding: 10px; margin: 10px 0; width: 100%; }
+    </style>
+  </head>
+  <body>
+    <h2>ESP32 Email Sender</h2>
+    <input type="email" id="email" placeholder="Enter your email">
+    <button onclick="sendEmail()">Send Email</button>
+    <p id="status">Status: ---</p>
+
+    <script>
+      async function sendEmail() {
+        let email = document.getElementById("email").value;
+        let response = await fetch(`/send?email=${encodeURIComponent(email)}`);
+        let text = await response.text();
+        document.getElementById("status").innerHTML = "Status: " + text;
+      }
+    </script>
+  </body>
+  </html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+/* =========================
+   Send Route
+========================= */
+void handleSend() {
+  if (!server.hasArg("email")) {
+    server.send(400, "text/plain", "No email provided");
+    return;
+  }
+
+  recipientEmail = server.arg("email");
+  recipientEmail.trim();
+
+  bool result = sendEmailNow();
+
+  if (result)
+    server.send(200, "text/plain", "Email sent successfully");
+  else
+    server.send(500, "text/plain", emailStatus);
+}
+
+/* =========================
+   Setup
+========================= */
+void setup() {
+  Serial.begin(115200);
+
+  WiFiManager wm;
+  wm.autoConnect("ESP32_Email_Setup");
+
+  MDNS.begin("breadmonitor");
+  
+  server.on("/", handleRoot);
+  server.on("/send", handleSend);
+
+  server.begin();
+}
+
+/* =========================
+   Main Loop
+========================= */
+void loop() {
+  server.handleClient();
+}
