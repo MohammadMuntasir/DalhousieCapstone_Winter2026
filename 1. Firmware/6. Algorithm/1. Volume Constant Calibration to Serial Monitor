@@ -1,0 +1,130 @@
+const int trigPin = 27;      // Trigger pin connected to ESP32 GPIO 27
+const int echoPin = 14;      // Echo pin connected to ESP32 GPIO 14
+
+#define SOUND_SPEED 0.0343   // Speed of sound in cm/us
+
+//distance measurement function
+float readDistanceCm();
+
+void setup() {
+  Serial.begin(115200);      // Start serial communication
+  delay(2000);               // Allow serial monitor to initialize
+
+  pinMode(trigPin, OUTPUT);  // Set trigger pin as output
+  pinMode(echoPin, INPUT);   // Set echo pin as input
+}
+
+//Main Loop
+void loop() {
+
+  //Calibration variables
+  String cmd;         // Stores user input from serial monitor
+  float H_sensor;     // Empty container distance
+  float H_500;        // Distance after adding 500 mL
+  float H_1000;       // Distance after adding 1000 mL
+  float h_500;        // Height corresponding to 500 mL
+  float h_1000;       // Height corresponding to 1000 mL
+
+  //Read Empty Container
+  Serial.println("Read base of container (Y): ");
+
+  while (Serial.available() == 0) {
+    // Wait until user enters something
+  }
+
+  cmd = Serial.readStringUntil('\n');
+  cmd.trim();   // Removes extra spaces/newline
+
+  if (cmd == "Y" || cmd == "y") {
+    H_sensor = readDistanceCm();
+    Serial.print("Base distance = ");
+    Serial.println(H_sensor);
+  }
+
+  //Read 500 mL Level
+  Serial.println("Read 500 mL (Y): ");
+
+  while (Serial.available() == 0) {
+    // Wait for input
+  }
+
+  cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+
+  if (cmd == "Y" || cmd == "y") {
+    H_500 = readDistanceCm();
+    Serial.print("500mL distance = ");
+    Serial.println(H_500);
+  }
+
+  //Read 1000 mL Level
+  Serial.println("Read 1000 mL (Y): ");
+
+  while (Serial.available() == 0) {
+    // Wait for input
+  }
+
+  cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+
+  if (cmd == "Y" || cmd == "y") {
+    H_1000 = readDistanceCm();
+    Serial.print("1000mL distance = ");
+    Serial.println(H_1000);
+  }
+
+  //Calculate Heights
+  h_500 = H_sensor - H_500;      // Height increase for 500mL
+  h_1000 = H_sensor - H_1000;    // Height increase for 1000mL
+
+  //Calculate Expansion Constant
+  float x = h_1000 / h_500;
+
+  Serial.println();
+  Serial.print("Volume expansion constant = ");
+  Serial.println(x);
+}
+
+//Distance Reading Function
+float readDistanceCm() {
+
+  float sum = 0;            // Sum of valid pulse durations
+  int validsamples = 0;     // Count valid readings
+  long duration;
+  float distance;
+
+  // Take 10 sensor readings
+  for (int i = 0; i < 10; i++) {
+
+    // Send ultrasonic pulse
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(trigPin, LOW);
+
+    // Read echo duration
+    duration = pulseIn(echoPin, HIGH, 30000);
+
+    // Store only valid readings
+    if (duration > 0) {
+      sum = sum + duration;
+      validsamples++;
+    }
+
+    // Small delay between samples
+    delay(20);
+  }
+
+  // Calculate average distance
+  if (validsamples > 0) {
+    distance = (sum / validsamples) * Sound_speed / 2.0;
+    return distance;
+  } 
+  else {
+    Serial.println("No valid readings");
+    return -1;   // Error value
+  }
+}
