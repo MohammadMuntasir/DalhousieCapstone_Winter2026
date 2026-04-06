@@ -1,71 +1,72 @@
-#include <WiFi.h>
-#include <WebServer.h>
-#include <WiFiManager.h>
-#include <ESP_Mail_Client.h>
-#include <ESPmDNS.h>
+//Include required libraries
+#include<WiFi.h>             //WiFi functions
+#include<WebServer.h>        //Web server functions
+#include<ESPmDNS.h>          //Local name access
+#include<WiFiManager.h>      //WiFi setup portal
+#include <ESP_Mail_Client.h> //Email sending library
 
-//Web Server
-WebServer server(80);
+//Create web server
+WebServer server(80);        //Server on port 80
 
-//Gmail SMTP Settings
+//Gmail SMTP settings
 #define AUTHOR_EMAIL    "breadrisingmonitor@gmail.com"
 #define AUTHOR_PASSWORD "kjcd lstj cxqk bfqf"
 
 #define SMTP_HOST "smtp.gmail.com"
 #define SMTP_PORT 465
 
-SMTPSession smtp;
-ESP_Mail_Session session;
-SMTP_Message message;
+SMTPSession smtp;            //SMTP session object
+ESP_Mail_Session session;    //Email session settings
+SMTP_Message message;        //Email message object
 
-String recipientEmail = "";
-String emailStatus = "Idle";
+String recipientEmail = "";  //Stores entered email
+String emailStatus = "Idle"; //Stores current email status
 
-//SMTP Callback
+//SMTP callback function
 void smtpCallback(SMTP_Status status) {
   if (status.success())
-    emailStatus = "Email sent successfully";
+    emailStatus = "Email sent successfully"; //Update success status
   else
-    emailStatus = "Email failed";
+    emailStatus = "Email failed"; //Update fail status
 }
 
-//Send Email Function
+//Send email function
 bool sendEmailNow() {
   if (recipientEmail.length() < 6) {
-    emailStatus = "Invalid email";
+    emailStatus = "Invalid email"; //Check basic email length
     return false;
   }
 
-  session.server.host_name = SMTP_HOST;
-  session.server.port = SMTP_PORT;
-  session.login.email = AUTHOR_EMAIL;
-  session.login.password = AUTHOR_PASSWORD;
-  session.login.user_domain = "";
+  session.server.host_name = SMTP_HOST;      //Set SMTP host
+  session.server.port = SMTP_PORT;           //Set SMTP port
+  session.login.email = AUTHOR_EMAIL;        //Set sender email
+  session.login.password = AUTHOR_PASSWORD;  //Set sender password
+  session.login.user_domain = "";            //No domain needed
 
-  message.clear();
-  message.sender.name = "ESP32 Webserver";
-  message.sender.email = AUTHOR_EMAIL;
-  message.subject = "ESP32 Notification";
-  message.addRecipient("User", recipientEmail.c_str());
+  message.clear();                           //Clear previous message
+  message.sender.name = "ESP32 Webserver";   //Set sender name
+  message.sender.email = AUTHOR_EMAIL;       //Set sender email
+  message.subject = "ESP32 Notification";    //Set email subject
+  message.addRecipient("User", recipientEmail.c_str()); //Add receiver
 
-  message.text.content = "Email sent using ESP32 webserver";
-  message.text.charSet = "utf-8";
+  message.text.content = "Email sent using ESP32 webserver"; //Email body
+  message.text.charSet = "utf-8";            //Set text encoding
 
-  smtp.callback(smtpCallback);
+  smtp.callback(smtpCallback);               //Attach callback function
 
   if (!smtp.connect(&session)) {
-    emailStatus = "SMTP connection failed";
+    emailStatus = "SMTP connection failed";  //Fail if server not connected
     return false;
   }
 
-  bool success = MailClient.sendMail(&smtp, &message);
-  smtp.closeSession();
+  bool success = MailClient.sendMail(&smtp, &message); //Send email
+  smtp.closeSession();                                  //Close SMTP session
 
-  emailStatus = success ? "Email sent successfully" : "Send failed";
+  emailStatus = success ? "Email sent successfully" : "Send failed"; //Final status
   return success;
 }
 
-//Root Web Page
+//Root web page
 void handleRoot() {
   String html = R"rawliteral(
   <!DOCTYPE html>
@@ -96,49 +97,43 @@ void handleRoot() {
   </html>
   )rawliteral";
 
-  server.send(200, "text/html", html);
+  server.send(200, "text/html", html); //Send webpage to browser
 }
 
-/* =========================
-   Send Route
-========================= */
+//Handle send route
 void handleSend() {
   if (!server.hasArg("email")) {
-    server.send(400, "text/plain", "No email provided");
+    server.send(400, "text/plain", "No email provided"); //Check email argument
     return;
   }
 
-  recipientEmail = server.arg("email");
-  recipientEmail.trim();
+  recipientEmail = server.arg("email"); //Get entered email
+  recipientEmail.trim();                //Remove extra spaces
 
-  bool result = sendEmailNow();
+  bool result = sendEmailNow();         //Try sending email
 
   if (result)
-    server.send(200, "text/plain", "Email sent successfully");
+    server.send(200, "text/plain", "Email sent successfully"); //Success reply
   else
-    server.send(500, "text/plain", emailStatus);
+    server.send(500, "text/plain", emailStatus); //Fail reply
 }
 
-/* =========================
-   Setup
-========================= */
+//Setup function
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200);                 //Start serial monitor
 
-  WiFiManager wm;
-  wm.autoConnect("ESP32_Email_Setup");
+  WiFiManager wm;                       //Create WiFiManager object
+  wm.autoConnect("ESP32_Email_Setup");  //Start auto WiFi portal
 
-  MDNS.begin("breadmonitor");
-  
-  server.on("/", handleRoot);
-  server.on("/send", handleSend);
+  MDNS.begin("breadmonitor");           //Start mDNS service
 
-  server.begin();
+  server.on("/", handleRoot);           //Root page route
+  server.on("/send", handleSend);       //Send email route
+
+  server.begin();                       //Start web server
 }
 
-/* =========================
-   Main Loop
-========================= */
+//Main loop
 void loop() {
-  server.handleClient();
+  server.handleClient();                //Handle incoming client requests
 }
