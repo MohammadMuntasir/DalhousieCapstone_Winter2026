@@ -15,12 +15,12 @@ const int trigPin = 27;   //Defining Trig Pin
 const int echoPin = 14;   //Defining echo Pin
 #define Sound_speed 0.0343//Speed of sound in cm/us
 
-/*===Function Declaration===*/
+//Function Declaration
 void handleRoot();        //Main Dashboard Page
 void handleData();        //JSON sensor data
 void handleNotFound();    //Page not found 404 page
 
-/*===WebServer Setup===*/
+//WebServer Setup
 WebServer server(80);   //Create WebSerserver Port 80
 
 void setup(){
