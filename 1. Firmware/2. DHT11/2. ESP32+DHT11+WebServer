@@ -1,0 +1,173 @@
+//Library Setup
+#include<WiFi.h>          // Enables WiFi functionality for ESP32
+#include<WebServer.h>     // Allows ESP32 to host a local web server
+#include<ESPmDNS.h>       // Enables local domain access using .local hostname
+#include<WiFiManager.h>   // Allows WiFi setup without hardcoded SSID and password
+#include <DHT.h>          //DHT sensor library 
+
+//DHT Parameter Setup
+#define DHTPIN 4 //Declaring GPIO pin for DHT sensor
+#define DHTTYPE DHT11 //Declaring specific DHT type 
+#define dt 1000 //Adding 1s delay
+
+DHT dht(DHTPIN, DHTTYPE); //Creating DHT object which requires PIN Number and sensor
+
+//Connecting Webserver
+WebServer server(80);     //Creating webserver at port 80
+
+//Function Prototype
+void handleRoot();      //Main dashboard page
+void handleData();      //JSON sensor data
+void handleNotFound();  //Page not found 404 page
+
+
+//Function decalaration
+void setup() {
+  dht.begin();          //Initializing DHT sensor
+  
+  WiFiManager wm;       //Setting up WiFi Manager to connect.
+  bool connect = wm.autoConnect("BreadMonitorSetup");// Creates AP portal if WiFi credentials are not saved
+
+  if(!connect){
+    ESP.restart();      // Restart ESP32 if WiFi connection fails
+  }
+
+  //Setup Domain Name
+  MDNS.begin("breadmonitor"); //Enables access through breadmonitor.local
+
+  //Define webpage routes
+  server.on("/", handleRoot);         //routes to main dashboard page
+  server.on("/data", handleData);     //routes to JSON sensor data
+  server.onNotFound(handleNotFound);  //routes to Page not found 404 page
+
+  //Start web server
+  server.begin();
+}
+
+//Main loop
+void loop() {
+  server.handleClient(); // Continuously listen for webpage requests
+}
+
+//JSON DATA ENDPOINT
+void handleData(){
+  float h = dht.readHumidity();    //read humidity from sensor
+  float t = dht.readTemperature(); //read temperature from sensor
+
+  //Checking if sensor reading data properly
+  if (isnan(h) || isnan(t)) {
+  server.send(500, "application/json", "{\"error\":\"Sensor failure\"}");
+  return;
+}
+  //JSON response string
+  //refer to JSON code for detail comment
+  String json = "{";
+  json += "\"temperature\":"+ String(t) + ",";
+  json += "\"humidity\":"+ String(h);
+  json += "}";
+
+  //Send json data to webpage
+  server.send(200,"application/json",json);
+}
+
+//Main dashboard webpage
+void handleRoot() {
+  //help writing HTML/CSS/JS w/o escape character
+  //refer to html code section for detail comment
+  String html =R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Temperature Display</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    </head>
+    <body>
+        <b>Bread Rising Monitor</b>
+        
+        <p><b>Temperature:</b> <span id="temp">--</span> &deg;C</p>
+        <p><b>Humidity:</b> <span id="hum">--</span> %RH</p>
+        
+        <p><b>Temperature Graph:</b></p>
+        <canvas id = "tempChart" width="400" height="200"></canvas>
+        
+        <p><b>Humidity Graph:</b></p>
+        <canvas id="humChart" width="400" height="200"></canvas>
+
+        <script>        
+          const templabels = [];
+          const tempData = [];
+          const humlabels = []
+          const humData = [];
+
+          const tempctx = document.getElementById('tempChart').getContext('2d');
+          const tempchart = new Chart(tempctx,{
+              type: 'line',
+              data:{
+                  labels: templabels,
+                  datasets: [
+                      {label: 'Temperature (°C)', data:tempData,borderWidth: 2}]
+              },
+              options:{
+                  animation:false}
+          });
+
+          const humctx = document.getElementById('humChart').getContext('2d');
+          const humchart = new Chart(humctx,{
+              type: 'line',
+              data:{
+                  labels:humlabels,
+                  datasets: [
+                      {label: 'Humidity (%RH)', data:humData,borderWidth: 2}]
+              },
+              options:{
+                  animation:false}
+          });
+
+          function updateData(){
+              const xhr = new XMLHttpRequest();
+              xhr.open("GET","/data",true);
+              xhr.onreadystatechange = function(){
+                  if(xhr.readyState === 4 && xhr.status === 200){
+                      const data = JSON.parse(xhr.responseText);
+                      const time = new Date().toLocaleTimeString();
+                      
+                      templabels.push(time);
+                      tempData.push(data.temperature);
+                      if(templabels.length>200){
+                          templabels.shift();
+                          tempData.shift();
+                      }
+                      tempchart.update();
+                      
+                      
+                      humlabels.push(time);
+                      humData.push(data.humidity);
+                      if(humlabels.length>200){
+                          humlabels.shift();
+                          humData.shift();
+                      }
+                      humchart.update();
+
+                      document.getElementById('temp').innerHTML = data.temperature;
+                      document.getElementById('hum').innerHTML = data.humidity;
+                  }
+                };
+                xhr.send();
+          }
+          setInterval(updateData,1000);
+
+          updateData();
+        </script>
+    </body>
+    </html>
+    )rawliteral";
+  // Send webpage to client browser  
+  server.send(200,"text/html",html);
+}
+
+//Page Not Found
+void handleNotFound(){
+  server.send(404,"text/plain","Page not found");
+}
