@@ -1,0 +1,177 @@
+//Library Setup
+#include<WiFi.h>          // Enables WiFi functionality for ESP32
+#include<WebServer.h>     // Allows ESP32 to host a local web server
+#include<ESPmDNS.h>       // Enables local domain access using .local hostname
+#include<WiFiManager.h>   // Allows WiFi setup without hardcoded SSID and password 
+
+//Ultrasonic Sensor Parameter
+const int trigPin = 27;   //Defining Trig Pin
+const int echoPin = 14;   //Defining echo Pin
+#define Sound_speed 0.0343//Speed of sound in cm/us
+
+//Function Declaration
+void handleRoot();        //Main Dashboard Page
+void handleData();        //JSON sensor data
+void handleNotFound();    //Page not found 404 page
+
+//WebServer Setup
+WebServer server(80);     //Creating webserver at port 80
+
+void setup() {
+  //WiFi Setup using WiFi Manager
+  WiFiManager wm;
+  bool connect = wm.autoConnect("Esp32MonitorSetup"); // Creates AP portal if WiFi credentials are not saved
+
+  if (!connect) {
+    ESP.restart(); // Restart ESP32 if WiFi connection fails
+  }
+
+  //mDNS Setup
+  MDNS.begin("Esp32monitor"); //Enables access through breadmonitor.local
+
+  //Ultrasonic Sensor Setup
+  pinMode(trigPin, OUTPUT);   //setting trigPin as output
+  pinMode(echoPin, INPUT);    //setting echoPin as input
+
+  //WebServer Routing
+  server.on("/", handleRoot);       //Route to main dashboard page
+  server.on("/data", handleData);   //Route to JSON sensor data 
+  server.onNotFound(handleNotFound);//routes to Page not found 404 page
+
+  //Start Webserver
+  server.begin();
+}
+
+//Main loop
+void loop() {
+  server.handleClient(); // Continuously listen for webpage requests
+}
+
+//Sensor data read and update through JSON
+void handleData() {
+  long duration;          //time taken by wave to reflect back
+  float distance = NAN;   //distance travelled by wave in cm
+  float sum = 0;          //variable to calculate average
+  int validsamples = 0;   //number of variable reading by sensor
+
+  //setting the sensor to take 10 samples for relaible distance reading
+  for (int i = 0; i < 10; i++) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(trigPin, LOW);
+
+    //measure the duration taken by the wave to reflect back
+    //"pulseIn()" function does the work of measuring duration
+    duration = pulseIn(echoPin, HIGH, 30000);
+
+    //if duration is positive it is a valid reading
+    if (duration > 0) {
+      sum += duration;
+      validsamples++;
+    }
+
+    delay(20);
+  }
+  //if there are valid readings then distance can be calculated
+  if (validsamples > 0) {
+    //distance = speed*time, time travels twice divide by 2, time is average out because of multiple readings
+    distance = (sum / validsamples) * Sound_speed / 2.0;
+  }
+
+  //JSON response
+  String json = "{";
+  if (!isnan(distance)) {
+    json += "\"distance\":" + String(distance);
+  } else {
+    json += "\"distance\":null";
+  }
+  json += "}";
+  //Send JSON response to browser
+  server.send(200, "application/json", json);
+}
+
+//Send Webpage to client
+void handleRoot() {
+  //Raw HTML webpage stored as string
+  //Rerfer to HTML section for detail comment
+  String html = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>ESP32 Distance Monitor</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    </head>
+    <body>
+        <h1><b>Bread Rising Monitor</b></h1>
+
+        <p><b>Distance: </b><span id="dist">--</span> cm</p>
+        <canvas id="distChart" width="400" height="200"></canvas>
+
+        <script>
+            const distlabels = [];
+            const distData = [];
+
+            const distctx = document.getElementById('distChart').getContext('2d');
+
+            const distchart = new Chart(distctx, {
+                type: 'line',
+                data: {
+                    labels: distlabels,
+                    datasets: [{
+                        label: 'Distance (cm)',
+                        data: distData,
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    animation: false
+                }
+            });
+
+            function updateData() {
+                const xhr = new XMLHttpRequest();
+
+                xhr.open("GET", "/data", true);
+
+                xhr.onreadystatechange = function() {
+                    if (xhr.readyState === 4 && xhr.status === 200) {
+                        const data = JSON.parse(xhr.responseText);
+                        const time = new Date().toLocaleTimeString();
+
+                        distlabels.push(time);
+                        distData.push(data.distance);
+
+                        if (distlabels.length > 180) {
+                            distlabels.shift();
+                            distData.shift();
+                        }
+
+                        distchart.update();
+
+                        document.getElementById('dist').innerHTML = data.distance;
+                    }
+                };
+
+                xhr.send();
+            }
+
+            setInterval(updateData, 1000);
+            updateData();
+        </script>
+    </body>
+    </html>
+  )rawliteral";
+  //Send webpage to browser
+  server.send(200, "text/html", html);
+}
+
+//If Page Not Found
+void handleNotFound() {
+  server.send(404, "text/plain", "Page not found");
+}
