@@ -1,0 +1,62 @@
+// Define ultrasonic sensor pins
+const int trigPin = 27;
+const int echoPin = 14;
+// Sound speed in air in cm/us
+#define Sound_speed 0.0343
+void setup() {
+  // Start serial communication
+  Serial.begin(115200);
+  delay(2500);
+  // Set trigger pin as output and echo pin as input
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+}
+
+void loop() {
+  // Variables for averaging multiple readings
+  float sum = 0;
+  int validsamples = 0;
+  long duration;
+  float distance;
+
+  // Take 10 sensor readings
+  for (int i = 0; i < 10; i++) {
+
+    // Send ultrasonic pulse
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(trigPin, LOW);
+
+    // Read the echo pulse duration
+    duration = pulseIn(echoPin, HIGH, 30000);
+
+    // Check if a valid reading is received
+    if (duration > 0) {
+      sum = sum + duration;
+      validsamples++;
+    }
+
+    // Small delay between readings
+    delay(20);
+  }
+
+  // Calculate average distance if valid readings exist
+  if (validsamples > 0) {
+    distance = (sum / validsamples) * Sound_speed / 2.0;
+
+    // Print calculated distance
+    Serial.print("Distance(cm): ");
+    Serial.println(distance);
+  } 
+  else {
+    // Print error if no valid readings
+    Serial.println("No valid readings");
+  }
+
+  // Wait 1 second before next measurement cycle
+  delay(1000);
+}
