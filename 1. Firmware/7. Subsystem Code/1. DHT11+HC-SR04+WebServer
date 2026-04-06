@@ -1,1 +1,261 @@
+//Include libraries
+#include<WiFi.h>        //WiFi library
+#include<WebServer.h>   //ESP32 Server Library
+#include<ESPmDNS.h>     //mDNS (access via name.local) library
+#include<WiFiManager.h> //WiFi auto-configuration portal library
+#include<DHT.h>         //DHT Sensor library
 
+//DHT Parameter Setup
+#define DHTPIN 4        //DHT data pin connected to GPIO D4
+#define DHTTYPE DHT11   //Defining specific DHT sensor type
+DHT dht(DHTPIN,DHTTYPE);//Create DHT object
+
+//Ultrasonic Sensor Parameter
+const int trigPin = 27;   //Defining Trig Pin
+const int echoPin = 14;   //Defining echo Pin
+#define Sound_speed 0.0343//Speed of sound in cm/us
+
+//Function Declaration
+void handleRoot();        //Main Dashboard Page
+void handleData();        //JSON sensor data
+void handleNotFound();    //Page not found 404 page
+
+//WebServer Setup
+WebServer server(80);   //Create WebSerserver Port 80
+
+void setup(){
+  //WiFi Setup using Wifi Manager
+  //WiFi Manager Object
+  WiFiManager wm;   
+  //If ESP32 has no saved WiFi credential it creates access point(AP) name "Esp32MonitorSetup"                    
+  bool connect = wm.autoConnect("Esp32MonitorSetup"); 
+  //If connection fails restart ESP32
+  if(!connect){
+    ESP.restart();  
+  }
+
+  //mDNS Setup
+  MDNS.begin("Esp32monitor");   //Allow access to ESP32 via: Esp32monitor.local
+  //Ultrasonic Sensor Setup
+  pinMode(trigPin, OUTPUT);   //setting trigPin as output
+  pinMode(echoPin, INPUT);    //setting echoPin as input
+  
+  //DHT setup
+  dht.begin();
+
+  //WebServer Routing
+  server.on("/",handleRoot);          //Route to Main Webpage
+  server.on("/data",handleData);      //Route to Handling JSON for Sensor Data
+  server.onNotFound(handleNotFound);  //Route to Handling if server not found
+  
+  //Start Webserver
+  server.begin();                     
+}
+
+//Main Loop
+void loop() {
+  server.handleClient();              //Handle incoming request and send data back to client
+}
+
+//Sensor data read and update through JSON
+void handleData(){
+  //Reading Data from Ultrasonic Sensor
+  long duration;          //time taken by wave to reflect back
+  float distance = NAN;   //distance travelled by wave in cm
+  float sum = 0;          //variable to calculate average
+  int validsamples = 0;   //number of variable reading by sensor
+
+  //setting the sensor to take 10 samples for relaible distance reading
+  for(int i=0; i<10;i++){
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+
+    //measure the duration taken by the wave to reflect back
+    //"pulseIn()" function does the work of measuring duration
+    duration = pulseIn(echoPin, HIGH,30000);
+    //if duration is positive it is a valid reading
+    if (duration>0){
+      sum=sum+duration;
+      validsamples++;
+    }
+    
+    delay(20);
+  }
+  //if there are valid readings then distance can be calculated
+  if(validsamples>0){
+    //distance = speed*time, time travels twice divide by 2, time is average out because of multiple readings
+    distance = (sum/validsamples)*Sound_speed/2.0;  
+  }
+
+  //Reading Data from DHT11
+  float h = dht.readHumidity();       //Read humidity from Sensor
+  float t = dht.readTemperature();    //Read temperature from Sensor
+  
+  //Checking if sensor reading data properly
+  if(isnan(h) || isnan(t)){
+    server.send(500,"application/json",R"({"error":"Sensor failure"})");
+    return;
+  }
+  //JSON response
+  String json = "{";
+  json += "\"temperature\":"+String(t)+",";
+  json += "\"humidity\":"+String(h)+",";
+  if(!isnan(distance)){
+    json += "\"distance\":"+String(distance);
+  }else{
+    json += "\"distance\":null";
+  }
+  json += "}";
+  //Send JSON response to browser
+  server.send(200,"application/json",json);
+}
+//Send Webpage to client
+//Refer to html section for detail comment
+void handleRoot(){
+  String html = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <!--Title shown in browser tab-->
+        <title>ESP32 Monitor</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    </head>
+    <body>
+        <!--Heading of Webpage-->
+        <h1><b>Bread Rising Monitor</b></h1>
+        <!--Temperature Display Section-->
+        <!--The span with id will be update automatically-->
+        <p><b>Temperature: </b><span id="temp">---</span> &deg;C</p>
+        <p><b>Temperature Graph</b></p>
+        <canvas id="tempChart" width="400" height="200"></canvas>
+        <!--Humidity display section-->
+        <!--The span with id will be update automatically-->
+        <p><b>Humidity: </b><span id="hum">---</span> %RH</p>
+        <p><b>Humidity Graph</b></p>
+        <canvas id="humChart" width="400" height="200"></canvas>
+        <p>Distance: <span id="dist">--</span> cm </p>
+        <canvas id = "distChart" width="400" height="200"></canvas>
+        <script>
+            const templabel = [];
+            const tempData = [];
+            const humlabel = [];
+            const humData = [];
+            const distlabels = [];
+            const distData = [];
+
+            const tempctx = document.getElementById('tempChart').getContext('2d');
+            const tempChart = new Chart(tempctx,{
+                type:'line',
+                data:{
+                    labels: templabel,
+                    datasets:[{label: 'Temperature (°C)', data:tempData,borderWidth: 2}]
+                },
+                options:{
+                    animation:false
+                }
+            });
+
+            const humctx = document.getElementById('humChart').getContext('2d');
+            const humChart = new Chart(humctx,{
+                type:'line',
+                data:{
+                    labels: humlabel,
+                    datasets:[{label: 'Humidity (%RH)', data:humData,borderWidth: 2}]
+                },
+                options:{
+                    animation:false
+                }
+            });
+
+            const distctx = document.getElementById('distChart').getContext('2d');
+            const distchart = new Chart(distctx,{
+                type: 'line',
+                data:{
+                labels: distlabels,
+                datasets: [{label: 'Distance(cm)',data:distData,borderWidth: 2}]
+                },
+                options:{animation:false}
+            });
+            /*
+            =========================================================
+            FUNCTION: updateData()
+            ---------------------------------------------------------
+            This function:
+            1. Sends a GET request to the ESP32 "/data" endpoint
+            2. Receives JSON data (temperature & humidity)
+            3. Updates the webpage values without refreshing
+            =========================================================
+            */
+          function updateData(){
+
+            //Create a nwe HTTP request object
+            const xhr = new XMLHttpRequest();
+            //Configure the requst:
+            //"GET"->method type
+            //"/data"->server endpoint
+            //true-> asynchronous request
+            xhr.open("GET","/data",true);
+            //This function runs whenever the request state changes
+            xhr.onreadystatechange = function(){
+                // readyState === 4 → request completed
+                // status === 200 → successful response
+                if(xhr.readyState===4 && xhr.status===200){
+                    //Convert JSON text into JavaScript object
+                    const data = JSON.parse(xhr.responseText);
+                    const time = new Date().toLocaleTimeString();
+                    //Update temperature chart in html
+                    templabel.push(time);
+                    tempData.push(data.temperature);
+                    if(templabel.length>180){
+                        templabel.shift();
+                        tempData.shift();
+                    }
+                    tempChart.update()
+                    //Update humidity chart in html
+                    humlabel.push(time);
+                    humData.push(data.humidity);
+                    if(humlabel.length>180){
+                        humlabel.shift();
+                        humData.shift();
+                    }
+                    humChart.update()
+                    //Update distance chart in html
+                    distlabels.push(time);
+                    distData.push(data.distance);
+                    if(distlabels.length>180){
+                        distlabels.shift();
+                        distData.shift();
+                    }
+                    distchart.update();
+                    //Update temperature in HTML
+                    document.getElementById('temp').innerHTML = data.temperature;
+                    //Update humidity value in HTML
+                    document.getElementById('hum').innerHTML = data.humidity;
+                    //Update distance value in HTML
+                    document.getElementById('dist').innerHTML = data.distance;
+                }
+            };
+            //Send the request to ESP32
+            xhr.send()
+          } 
+          //Update page every 1s
+          setInterval(updateData,1000);
+          //Run once immediately when page load
+          updateData();
+        </script>
+    </body>
+    </html>
+  )rawliteral";
+  //Send webpage to browser
+  server.send(200,"text/html",html);
+}
+
+//If Page Not Found
+void handleNotFound(){
+  server.send(404,"text/plain","Page not found");
+}
