@@ -1,0 +1,40 @@
+//This code connects to the DHT11 and display sensor data to serial Monitor
+
+#include <DHT.h> //DHT sensor library by Adafruit
+
+#define DHTPIN 4       //Declaring GPIO pin for DHT sensor
+#define DHTTYPE DHT11  //Declaring specific DHT type
+#define dt 2000        //Declaring delay in ms
+
+//Create DHT object named dht which require PIN Number and sensor type
+DHT dht(DHTPIN, DHTTYPE);
+
+void setup(){
+  Serial.begin(115200); //Starting Serial Communication
+  delay(2500);		//Small delay for the ESP32 to establish serial communication with Arduino IDE
+  dht.begin();          //Initializing DHT sensor
+}
+
+void loop(){
+  float h = dht.readHumidity();    //read humidity from sensor 
+  float t = dht.readTemperature(); //read temperature from sensor
+
+  //isnan() checks if h and t is a number
+  //this loop only works if there is sensor or wiring failure
+  if(isnan(h) || isnan(t)){
+    Serial.print("Failed to read from DHT sensor!"); //Printing issue
+    return;
+  }
+  //printing temperature
+  Serial.print("Temperature:");
+  Serial.print(t);
+  Serial.println(" °C");
+  
+  //Printing humidity
+  Serial.print("Humidity:");
+  Serial.print(h);
+  Serial.println(" %");
+  
+  Serial.println();
+  delay(dt);
+}
