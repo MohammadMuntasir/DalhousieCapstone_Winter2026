@@ -3,5 +3,5 @@ This repository hosts the source code for the Electrical and Computer Engineerin
 
 Some precautions:
   - While uploading the code to ESP32 make sure "Partition Scheme" is set to "No OTA(2MB APP/ 2MB FATFS)". It done through Arduino IDE Tools drop down menu.
-  - Make sure SD card is formatted to "FAT32"
-  - Arduino IDE 
+  - Make sure SD card is formatted to "FAT32".
+  - Make sure proper USB driver is downloaded to upload code into ESP32.
