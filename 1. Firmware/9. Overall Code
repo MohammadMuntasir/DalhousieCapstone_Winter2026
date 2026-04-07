@@ -1,0 +1,934 @@
+/*===Library Setup===*/
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <WiFiManager.h>
+#include <DHT.h>
+#include <math.h>
+#include "FS.h"
+#include "SD.h"
+#include <SPI.h>
+#include "time.h"
+#include <ESP_Mail_Client.h>   // Mobizt ESP Mail Client
+#include <WiFiClientSecure.h>  // Firebase HTTP
+#include <HTTPClient.h>
+
+/*===DHT Parameter Setup===*/
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+/*===Ultrasonic Pins===*/
+const int trigPin = 27;
+const int echoPin = 14;
+#define Sound_speed 0.0343  // cm/uS
+
+/*===WebServer Setup===*/
+WebServer server(80);
+
+volatile bool experimentRunning = false;
+volatile bool alarmTriggered = false;
+
+/* =============================
+   Experiment readings
+============================= */
+float H_sensor = NAN;  // experiment base to sensor
+float H_o      = NAN;  // initial dough surface to sensor
+float H_d      = NAN;  // initial dough height = H_sensor - H_o
+
+/* =============================
+   Constant calibration readings
+============================= */
+float H_sensor_const = NAN;   // calibration base to sensor
+float H_500 = NAN;            // 500 mL reading
+float H_1000 = NAN;           // 1000 mL reading
+float volumeConstant = NAN;   // height_1000 / height_500
+
+/* Live values */
+float currentDistance = NAN;
+float rise = NAN;
+float totalHeight = NAN;
+
+/* Timing */
+unsigned long lastUpdate = 0;
+const unsigned long UPDATE_MS = 1000;
+
+/* ========================================================
+   NTP + SD logging config
+   ======================================================== */
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = -18000;
+const int   daylightOffset_sec = 3600;
+
+const char* LOG_PATH = "/fermentation_log.csv";
+const unsigned long LOG_INTERVAL_MS = 1000;
+unsigned long lastLog = 0;
+
+bool sdReady = false;
+bool timeReady = false;
+
+/* ========================================================
+   Firebase config
+   ======================================================== */
+const char* firebaseHost = "https://esp32-project-f8947-default-rtdb.firebaseio.com";
+WiFiClientSecure firebaseClient;
+unsigned long lastFirebaseSend = 0;
+const unsigned long FIREBASE_INTERVAL_MS = 10000;
+
+/* ========================================================
+   Gmail SMTP + recipient-from-webpage
+   ======================================================== */
+static const char* AUTHOR_EMAIL    = "breadrisingmonitor@gmail.com";
+static const char* AUTHOR_APP_PASS = "kjcd lstj cxqk bfqf";
+
+static const char* SMTP_HOST = "smtp.gmail.com";
+static const int   SMTP_PORT = 465;
+
+SMTPSession smtp;
+ESP_Mail_Session session;
+SMTP_Message message;
+
+volatile bool sendRequested = false;
+bool alarmEmailSent = false;
+
+String recipientEmail = "";
+String lastStatus = "Email: idle";
+
+/*========================================================
+  Routes
+========================================================*/
+void handleRoot();
+void handleData();
+void handleAction();
+void handleNotFound();
+
+void handleStatus();
+void handleNotify();
+void handleSetRecipient();
+
+void handleDownloadCSV();
+void handleClearCSV();
+
+/* ========================================================
+   Time / NTP helpers
+   ======================================================== */
+String getFormattedDateTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "0000-00-00 00:00:00";
+  }
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+unsigned long getTimeStamp() {
+  time_t now;
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo)) {
+    return 0;
+  }
+
+  time(&now);
+  return (unsigned long)now;
+}
+
+/*========================================================
+  Ultrasonic readDistanceCm
+========================================================*/
+float readDistanceCm(int samples) {
+  float sum = 0;
+  int validsamples = 0;
+  float distance;
+  for (int i = 0; i < samples; i++) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+
+    long duration = pulseIn(echoPin, HIGH, 30000);
+    if (duration > 0) {
+      sum += duration;
+      validsamples++;
+    }
+    delay(20);
+  }
+  if (validsamples == 0) {
+    return NAN;
+  }
+  distance = (sum / validsamples) * Sound_speed / 2.0;
+  return distance;
+}
+
+/*========================================================
+  Experiment update
+========================================================*/
+void updateExperiment() {
+  if (!experimentRunning) return;
+  if (millis() - lastUpdate < UPDATE_MS) return;
+  lastUpdate = millis();
+
+  currentDistance = readDistanceCm(10);
+  if (isnan(currentDistance) || isnan(H_o) || isnan(H_d) || isnan(volumeConstant)) return;
+
+  rise = H_o - currentDistance;
+  totalHeight = rise + H_d;
+
+  float target = volumeConstant * H_d;
+
+  if (fabs(totalHeight - target) < 0.5) {
+    if (!alarmTriggered) {
+      alarmTriggered = true;
+
+      if (!alarmEmailSent) {
+        sendRequested = true;
+        alarmEmailSent = true;
+        lastStatus = "Email queued…";
+      }
+    }
+  }
+}
+
+/* ========================================================
+   SD card functions
+   ======================================================== */
+void appendFile(fs::FS& fs, const char* path, const char* message) {
+  File file = fs.open(path, FILE_APPEND);
+  if (!file) return;
+  file.print(message);
+  file.close();
+}
+
+void ensureLogHeader() {
+  if (!sdReady) return;
+  if (!SD.exists(LOG_PATH)) {
+    File file = SD.open(LOG_PATH, FILE_WRITE);
+    if (file) {
+      file.println("Timestamp,TemperatureC,HumidityPct,TotalHeightCm,InitialHeightCm");
+      file.close();
+    }
+  }
+}
+
+void logBreadData(float temperature, float humidity) {
+  if (!sdReady) return;
+  if (isnan(temperature) || isnan(humidity)) return;
+
+  String ts = getFormattedDateTime();
+
+  String line = ts + "," +
+                String(temperature, 1) + "," +
+                String(humidity, 1) + ",";
+
+  if (!isnan(totalHeight)) line += String(totalHeight, 2);
+  else                     line += "";
+
+  line += ",";
+
+  if (!isnan(H_d)) line += String(H_d, 2);
+  else             line += "";
+
+  line += "\n";
+  appendFile(SD, LOG_PATH, line.c_str());
+}
+
+/* ========================================================
+   Firebase sender
+   ======================================================== */
+void sendToFirebase(float temperature, float humidity) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (isnan(temperature) || isnan(humidity)) return;
+
+  unsigned long timestamp = getTimeStamp();
+  if (timestamp == 0) return;
+
+  String json = "{";
+  json += "\"temperature\":" + String(temperature, 1) + ",";
+  json += "\"humidity\":" + String(humidity, 1) + ",";
+  json += "\"timestamp\":" + String(timestamp) + ",";
+
+  if (!isnan(totalHeight)) json += "\"totalHeight\":" + String(totalHeight, 2) + ",";
+  else                     json += "\"totalHeight\":null,";
+
+  if (!isnan(H_d)) json += "\"initialHeight\":" + String(H_d, 2) + ",";
+  else             json += "\"initialHeight\":null,";
+
+  if (!isnan(H_sensor)) json += "\"H_sensor\":" + String(H_sensor, 2) + ",";
+  else                  json += "\"H_sensor\":null,";
+
+  if (!isnan(H_o)) json += "\"H_o\":" + String(H_o, 2) + ",";
+  else             json += "\"H_o\":null,";
+
+  if (!isnan(H_d)) json += "\"H_d\":" + String(H_d, 2) + ",";
+  else             json += "\"H_d\":null,";
+
+  if (!isnan(volumeConstant)) json += "\"constant\":" + String(volumeConstant, 4) + ",";
+  else                        json += "\"constant\":null,";
+
+  json += "\"running\":";
+  json += (experimentRunning ? "true" : "false");
+  json += ",";
+
+  json += "\"alarm\":";
+  json += (alarmTriggered ? "true" : "false");
+
+  json += "}";
+
+  String path = String(firebaseHost) + "/breadMonitor/" + String(timestamp) + ".json";
+
+  HTTPClient http;
+  http.begin(firebaseClient, path);
+  http.addHeader("Content-Type", "application/json");
+  http.PUT(json);
+  http.end();
+}
+
+/* ========================================================
+   CSV download + clear
+   ======================================================== */
+void handleDownloadCSV() {
+  if (!sdReady) {
+    server.send(500, "text/plain", "SD not ready");
+    return;
+  }
+  if (!SD.exists(LOG_PATH)) {
+    server.send(404, "text/plain", "Log file not found");
+    return;
+  }
+
+  File file = SD.open(LOG_PATH, FILE_READ);
+  if (!file) {
+    server.send(500, "text/plain", "Failed to open log");
+    return;
+  }
+
+  server.sendHeader("Content-Type", "text/csv");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"fermentation_log.csv\"");
+  server.sendHeader("Connection", "close");
+  server.streamFile(file, "text/csv");
+  file.close();
+}
+
+void handleClearCSV() {
+  if (!sdReady) {
+    server.send(500, "text/plain", "SD not ready");
+    return;
+  }
+  if (SD.exists(LOG_PATH)) SD.remove(LOG_PATH);
+  ensureLogHeader();
+  server.send(200, "text/plain", "OK");
+}
+
+/* ========================================================
+   Email functions
+   ======================================================== */
+void smtpCallback(SMTP_Status status) {
+  if (status.success()) lastStatus = "Email sent";
+  else                  lastStatus = "Email failed";
+}
+
+bool sendEmailNow(const String& subject, const String& bodyText) {
+  if (recipientEmail.length() < 6 || recipientEmail.indexOf('@') < 1 || recipientEmail.indexOf('.') < 3) {
+    lastStatus = "Set a valid recipient email first";
+    return false;
+  }
+
+  session.server.host_name = SMTP_HOST;
+  session.server.port = SMTP_PORT;
+  session.login.email = AUTHOR_EMAIL;
+  session.login.password = AUTHOR_APP_PASS;
+  session.login.user_domain = "";
+
+  message.clear();
+  message.sender.name = "Bread Rising Monitor";
+  message.sender.email = AUTHOR_EMAIL;
+  message.subject = subject;
+  message.addRecipient("User", recipientEmail.c_str());
+
+  message.text.content = bodyText.c_str();
+  message.text.charSet = "utf-8";
+  message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+
+  smtp.callback(smtpCallback);
+
+  if (!smtp.connect(&session)) {
+    lastStatus = "SMTP connect failed";
+    smtp.closeSession();
+    return false;
+  }
+
+  bool ok = MailClient.sendMail(&smtp, &message);
+  smtp.closeSession();
+
+  lastStatus = ok ? "Email sent" : "Send failed";
+  return ok;
+}
+
+/*========================================================
+  /data endpoint
+========================================================*/
+void handleData() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (isnan(h) || isnan(t)) {
+    server.send(500, "application/json", R"({"error":"Sensor failure"})");
+    return;
+  }
+
+  String json = "{";
+  json += "\"temperature\":" + String(t) + ",";
+  json += "\"humidity\":" + String(h) + ",";
+  json += "\"running\":" + String(experimentRunning ? "true" : "false") + ",";
+  json += "\"alarm\":" + String(alarmTriggered ? "true" : "false") + ",";
+  json += "\"metricName\":\"Total Height (cm)\",";
+
+  if (!isnan(totalHeight)) json += "\"metric\":" + String(totalHeight) + ",";
+  else                     json += "\"metric\":null,";
+
+  if (!isnan(H_sensor)) json += "\"H_sensor\":" + String(H_sensor) + ",";
+  else                  json += "\"H_sensor\":null,";
+
+  if (!isnan(H_o)) json += "\"H_o\":" + String(H_o) + ",";
+  else             json += "\"H_o\":null,";
+
+  if (!isnan(H_d)) json += "\"H_d\":" + String(H_d) + ",";
+  else             json += "\"H_d\":null,";
+
+  if (!isnan(H_sensor_const)) json += "\"H_sensor_const\":" + String(H_sensor_const) + ",";
+  else                        json += "\"H_sensor_const\":null,";
+
+  if (!isnan(H_500)) json += "\"H_500\":" + String(H_500) + ",";
+  else               json += "\"H_500\":null,";
+
+  if (!isnan(H_1000)) json += "\"H_1000\":" + String(H_1000) + ",";
+  else                json += "\"H_1000\":null,";
+
+  if (!isnan(volumeConstant)) json += "\"constant\":" + String(volumeConstant, 4) + ",";
+  else                        json += "\"constant\":null,";
+
+  json += "\"sdReady\":" + String(sdReady ? "true" : "false") + ",";
+  json += "\"timeReady\":" + String(timeReady ? "true" : "false");
+
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+/*========================================================
+  /action endpoint
+========================================================*/
+void handleAction() {
+  if (!server.hasArg("cmd")) {
+    server.send(400, "text/plain", "Missing cmd");
+    return;
+  }
+
+  String cmd = server.arg("cmd");
+
+  if (cmd == "constBase") {
+    H_sensor_const = readDistanceCm(100);
+    H_500 = NAN;
+    H_1000 = NAN;
+    volumeConstant = NAN;
+    server.send(200, "text/plain", isnan(H_sensor_const) ? "FAIL" : "OK");
+    return;
+  }
+
+  if (cmd == "cal500") {
+    if (isnan(H_sensor_const)) {
+      server.send(400, "text/plain", "Read constant base first");
+      return;
+    }
+    H_500 = readDistanceCm(100);
+    server.send(200, "text/plain", isnan(H_500) ? "FAIL" : "OK");
+    return;
+  }
+
+  if (cmd == "cal1000") {
+    if (isnan(H_sensor_const) || isnan(H_500)) {
+      server.send(400, "text/plain", "Do constant base + 500 mL first");
+      return;
+    }
+    H_1000 = readDistanceCm(100);
+
+    if (!isnan(H_1000)) {
+      float height_500 = H_sensor_const - H_500;
+      float height_1000 = H_sensor_const - H_1000;
+      if (height_500 != 0) {
+        volumeConstant = height_1000 / height_500;
+      }
+    }
+
+    server.send(200, "text/plain", (isnan(H_1000) || isnan(volumeConstant)) ? "FAIL" : "OK");
+    return;
+  }
+
+  if (cmd == "setConstant") {
+    if (!server.hasArg("value")) {
+      server.send(400, "text/plain", "Missing value");
+      return;
+    }
+
+    float val = server.arg("value").toFloat();
+    if (val <= 0) {
+      server.send(400, "text/plain", "Invalid constant");
+      return;
+    }
+
+    volumeConstant = val;
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  if (cmd == "base") {
+    H_sensor = readDistanceCm(100);
+    H_o = NAN;
+    H_d = NAN;
+    rise = NAN;
+    totalHeight = NAN;
+    experimentRunning = false;
+    alarmTriggered = false;
+    alarmEmailSent = false;
+
+    server.send(200, "text/plain", isnan(H_sensor) ? "FAIL" : "OK");
+    return;
+  }
+
+  if (cmd == "surface") {
+    if (isnan(H_sensor)) {
+      server.send(400, "text/plain", "Read experiment base first");
+      return;
+    }
+
+    H_o = readDistanceCm(100);
+    if (!isnan(H_o)) {
+      H_d = H_sensor - H_o;
+      rise = 0;
+      totalHeight = H_d;
+    }
+
+    experimentRunning = false;
+    alarmTriggered = false;
+    alarmEmailSent = false;
+
+    server.send(200, "text/plain", isnan(H_o) ? "FAIL" : "OK");
+    return;
+  }
+
+  if (cmd == "start") {
+    if (isnan(H_sensor) || isnan(H_o) || isnan(H_d) || isnan(volumeConstant)) {
+      server.send(400, "text/plain", "Do experiment base + surface + constant first");
+      return;
+    }
+
+    alarmTriggered = false;
+    alarmEmailSent = false;
+    experimentRunning = true;
+    lastUpdate = 0;
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  if (cmd == "stop") {
+    experimentRunning = false;
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  if (cmd == "resetAlarm") {
+    alarmTriggered = false;
+    alarmEmailSent = false;
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  server.send(400, "text/plain", "Unknown cmd");
+}
+
+/*========================================================
+  /status endpoint for email UI
+========================================================*/
+void handleStatus() {
+  String json = "{";
+  json += "\"status\":\"" + lastStatus + "\",";
+  json += "\"recipient\":\"" + recipientEmail + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleNotify() {
+  sendRequested = true;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleSetRecipient() {
+  if (!server.hasArg("email")) {
+    server.send(400, "text/plain", "Missing email");
+    return;
+  }
+  String e = server.arg("email");
+  e.trim();
+
+  if (e.length() < 6 || e.indexOf('@') < 1 || e.indexOf('.') < 3) {
+    server.send(400, "text/plain", "Invalid email");
+    return;
+  }
+
+  recipientEmail = e;
+  lastStatus = "Recipient set";
+  server.send(200, "text/plain", "OK");
+}
+
+/*========================================================
+  Webpage
+========================================================*/
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bread Rising Monitor</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 12px; }
+    button { padding: 10px 12px; margin: 6px 4px; }
+    input { padding: 10px 12px; margin: 6px 4px; border-radius: 10px; border: 1px solid #ccc; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 10px; margin: 10px 0; }
+    .ok { color: green; font-weight: bold; }
+    .bad { color: crimson; font-weight: bold; }
+    .small{opacity:.8;font-size:14px}
+  </style>
+</head>
+<body>
+  <h2>Bread Rising Monitor </h2>
+
+  <div class="card">
+    <h3>Email notification</h3>
+    <p>Enter your Gmail for optimal rise notification</p>
+    <div class="row">
+      <input id="rec" type="email" placeholder="Recipient email (e.g. you@gmail.com)" style="flex:1;min-width:220px">
+      <button onclick="setRecipient()">Save Recipient</button>
+      <button onclick="sendTest()">Send Test</button>
+    </div>
+    <div class="small">
+      <b>Recipient:</b> <span id="recShow">---</span><br/>
+      <b>Email status:</b> <span id="emailSt">---</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Constant setup</h3>
+
+    <div class="row">
+      <input id="manualConstant" type="number" step="any" placeholder="Enter saved constant">
+      <button onclick="setConstantManual()">Use Manual Constant</button>
+    </div>
+
+    <p><b>Saved / Active Constant:</b> <span id="constVal">---</span></p>
+
+    <hr>
+
+    <p><b>Or recalibrate constant</b></p>
+
+    <div class="row">
+      <button onclick="doCmd('constBase')">Read Constant Base (empty)</button>
+    </div>
+    <p><b>Constant Base Distance:</b> <span id="HsConst">---</span> cm</p>
+
+    <div class="row">
+      <button onclick="doCmd('cal500')">Read 500 mL</button>
+      <button onclick="doCmd('cal1000')">Read 1000 mL</button>
+    </div>
+
+    <p><b>500 mL Reading:</b> <span id="H500">---</span> cm</p>
+    <p><b>1000 mL Reading:</b> <span id="H1000">---</span> cm</p>
+  </div>
+
+  <div class="card">
+    <h3>Experiment setup</h3>
+
+    <div class="row">
+      <button onclick="doCmd('base')">Read Base (empty)</button>
+      <button onclick="doCmd('surface')">Read Surface (initial)</button>
+    </div>
+
+    <div class="row">
+      <button onclick="doCmd('start')">Start</button>
+      <button onclick="doCmd('stop')">Stop</button>
+      <button onclick="doCmd('resetAlarm')">Reset Alarm</button>
+    </div>
+
+    <p>
+      <b>Status:</b> <span id="running">---</span> |
+      <b>Notification:</b> <span id="alarm">---</span>
+    </p>
+
+    <p><b>Sensor to Base Distance:</b> <span id="Hs">---</span> cm</p>
+    <p><b>Initial Dough Surface Distance:</b> <span id="Ho">---</span> cm</p>
+    <p><b>Initial Dough Height:</b> <span id="Hd">---</span> cm</p>
+    <p><b>Total Height:</b> <span id="metricVal">---</span> cm</p>
+
+    <p class="small">
+      <b>SD:</b> <span id="sd">---</span> |
+      <b>Time:</b> <span id="tm">---</span>
+    </p>
+  </div>
+
+  <div class="card">
+    <p><b>Data logging (CSV)</b></p>
+    <div class="row">
+      <button onclick="downloadCSV()">Download CSV</button>
+      <button onclick="clearCSV()">Clear CSV</button>
+    </div>
+    <div class="small">
+      The CSV downloads to your phone/computer via the browser.
+    </div>
+  </div>
+
+  <div class="card">
+    <p><b>Temperature:</b> <span id="temp">---</span> °C</p>
+    <canvas id="tempChart" width="400" height="180"></canvas>
+  </div>
+
+  <div class="card">
+    <p><b>Humidity:</b> <span id="hum">---</span> %RH</p>
+    <canvas id="humChart" width="400" height="180"></canvas>
+  </div>
+
+  <div class="card">
+    <p><b>Total Height (cm) vs time</b></p>
+    <p><b>Total Height:</b> <span id="metricValChart">---</span> cm</p>
+    <canvas id="metricChart" width="400" height="200"></canvas>
+  </div>
+
+<script>
+  const tLabels = [], tData = [];
+  const hLabels = [], hData = [];
+  const mLabels = [], mData = [];
+
+  const tempChart = new Chart(document.getElementById('tempChart').getContext('2d'), {
+    type: 'line',
+    data: { labels: tLabels, datasets: [{ label: 'Temperature (°C)', data: tData, borderWidth: 2 }] },
+    options: { animation: false }
+  });
+
+  const humChart = new Chart(document.getElementById('humChart').getContext('2d'), {
+    type: 'line',
+    data: { labels: hLabels, datasets: [{ label: 'Humidity (%RH)', data: hData, borderWidth: 2 }] },
+    options: { animation: false }
+  });
+
+  const metricChart = new Chart(document.getElementById('metricChart').getContext('2d'), {
+    type: 'line',
+    data: { labels: mLabels, datasets: [{ label: 'Total Height (cm)', data: mData, borderWidth: 2 }] },
+    options: { animation: false }
+  });
+
+  function doCmd(cmd){
+    fetch(`/action?cmd=${cmd}`)
+      .then(r => r.text())
+      .then(txt => {
+        if(txt !== "OK") alert(txt);
+      });
+  }
+
+  async function setConstantManual(){
+    const val = document.getElementById('manualConstant').value.trim();
+    if(!val){ alert("Enter a constant first"); return; }
+
+    const r = await fetch(`/action?cmd=setConstant&value=${encodeURIComponent(val)}`);
+    const t = await r.text();
+    if(!r.ok){ alert(t); return; }
+  }
+
+  function pushLimited(labels, dataArr, x, y){
+    labels.push(x);
+    dataArr.push(y);
+    if(labels.length > 180){
+      labels.shift();
+      dataArr.shift();
+    }
+  }
+
+  async function updateData(){
+    const res = await fetch('/data');
+    if(!res.ok) return;
+    const data = await res.json();
+
+    const time = new Date().toLocaleTimeString();
+
+    document.getElementById('temp').textContent = data.temperature;
+    document.getElementById('hum').textContent = data.humidity;
+
+    document.getElementById('running').textContent = data.running ? "RUNNING" : "STOPPED";
+    document.getElementById('running').className = data.running ? "ok" : "bad";
+
+    document.getElementById('alarm').textContent = data.alarm ? "TRIGGERED" : "OK";
+    document.getElementById('alarm').className = data.alarm ? "bad" : "ok";
+
+    document.getElementById('metricVal').textContent = (data.metric === null) ? "---" : data.metric;
+    document.getElementById('metricValChart').textContent = (data.metric === null) ? "---" : data.metric;
+
+    document.getElementById('Hs').textContent = (data.H_sensor === null) ? "---" : data.H_sensor;
+    document.getElementById('Ho').textContent = (data.H_o === null) ? "---" : data.H_o;
+    document.getElementById('Hd').textContent = (data.H_d === null) ? "---" : data.H_d;
+
+    document.getElementById('HsConst').textContent = (data.H_sensor_const === null) ? "---" : data.H_sensor_const;
+    document.getElementById('H500').textContent = (data.H_500 === null) ? "---" : data.H_500;
+    document.getElementById('H1000').textContent = (data.H_1000 === null) ? "---" : data.H_1000;
+    document.getElementById('constVal').textContent = (data.constant === null) ? "---" : data.constant;
+
+    document.getElementById('sd').textContent = data.sdReady ? "OK" : "NO";
+    document.getElementById('tm').textContent = data.timeReady ? "OK" : "NO";
+
+    if(data.running){
+      pushLimited(tLabels, tData, time, data.temperature);
+      pushLimited(hLabels, hData, time, data.humidity);
+      if(data.metric !== null){
+        pushLimited(mLabels, mData, time, data.metric);
+      }
+    }
+
+    tempChart.update();
+    humChart.update();
+    metricChart.update();
+  }
+
+  async function refreshEmail(){
+    const r = await fetch('/status');
+    if(!r.ok) return;
+    const j = await r.json();
+    document.getElementById('emailSt').textContent = j.status || "---";
+    document.getElementById('recShow').textContent = (j.recipient && j.recipient.length) ? j.recipient : "---";
+  }
+
+  async function setRecipient(){
+    const e = document.getElementById('rec').value.trim();
+    if(!e){ alert("Enter an email first"); return; }
+    const r = await fetch(`/setRecipient?email=${encodeURIComponent(e)}`);
+    const t = await r.text();
+    if(!r.ok){ alert(t); return; }
+    refreshEmail();
+  }
+
+  async function sendTest(){
+    document.getElementById('emailSt').textContent = "Sending...";
+    await fetch('/notify', {method:'POST'});
+    setTimeout(refreshEmail, 900);
+  }
+
+  function downloadCSV(){
+    window.location.href = "/download";
+  }
+
+  async function clearCSV(){
+    if(!confirm("Clear the CSV log on SD card?")) return;
+    const r = await fetch("/clearlog", {method:"POST"});
+    const t = await r.text();
+    if(!r.ok) alert(t);
+    else alert("Cleared");
+  }
+
+  setInterval(updateData, 1000);
+  updateData();
+
+  setInterval(refreshEmail, 2000);
+  refreshEmail();
+</script>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "Page not found");
+}
+
+/*========================================================
+  Setup / Loop
+========================================================*/
+void setup() {
+  WiFiManager wm;
+  bool connect = wm.autoConnect("BreadMonitorSetup");
+  if (!connect) {
+    ESP.restart();
+  }
+
+  MDNS.begin("breadmonitor");
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  dht.begin();
+
+  sdReady = SD.begin();
+  if (sdReady) {
+    ensureLogHeader();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    struct tm timeinfo;
+    timeReady = getLocalTime(&timeinfo);
+  }
+
+  firebaseClient.setInsecure();
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/action", handleAction);
+  server.onNotFound(handleNotFound);
+
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/notify", HTTP_POST, handleNotify);
+  server.on("/setRecipient", HTTP_GET, handleSetRecipient);
+
+  server.on("/download", HTTP_GET, handleDownloadCSV);
+  server.on("/clearlog", HTTP_POST, handleClearCSV);
+
+  server.begin();
+
+  lastLog = millis();
+  lastFirebaseSend = millis();
+}
+
+void loop() {
+  server.handleClient();
+  updateExperiment();
+
+  unsigned long now = millis();
+
+  if (now - lastLog >= LOG_INTERVAL_MS) {
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+    logBreadData(t, h);
+    lastLog = now;
+  }
+
+  if (now - lastFirebaseSend >= FIREBASE_INTERVAL_MS) {
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+    sendToFirebase(t, h);
+    lastFirebaseSend = now;
+  }
+
+  if (sendRequested) {
+    sendRequested = false;
+
+    String subject = "BreadMonitor: Sourdough Doubled";
+    String body =
+      "Sourdough has approximately doubled in Volume.\n\n"
+      "Current total height (cm): " + String(totalHeight) + "\n"
+      "Initial Height (cm): " + String(H_d) + "\n"
+      "Constant: " + String(volumeConstant, 4) + "\n";
+
+    sendEmailNow(subject, body);
+  }
+}
